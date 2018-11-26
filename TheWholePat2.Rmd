@@ -1,0 +1,560 @@
+---
+title: "TheWholePat_2"
+author: "Yuan"
+date: "10/24/2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,warning = FALSE)
+```
+
+## Part 1: Data preparation
+```{r load packages}
+library(stringr)
+library(plyr)
+library(dplyr)
+library(ggplot2)
+library(GGally)
+library(CCA)
+library(pheatmap)
+library(plotly)
+library(reshape2)
+library(PMA)
+library(caret)
+library(Hmisc)
+library(parallel)
+library(knitr)
+# load the functions which are writed by Cedric Huchuan Xia
+source('E:\\lab\\FEP\\1011sCCA\\cca_functions.R')
+```
+
+```{r Set the main path}
+path = 'E:\\lab\\FEP\\FEP2'
+```
+
+```{r load data}
+fn = 'FEP_MRI_list.csv'  
+filename = paste(path,fn,sep = '\\')
+clin = read.csv(filename)
+colnames(clin)[1] = 'ID'
+rownames(clin) = clin[,1]
+
+fn = 'FEP_fa_Feb2018.csv' 
+filename = paste(path,fn,sep = '\\')
+fa = read.csv(filename)
+colnames(fa)[1] = 'ID'
+colnames(fa)[2:length(fa)] = paste("fa",colnames(fa[,c(2:length(fa))]))
+rownames(fa) = fa[,1]
+
+fn = 'FEP_MD_Feb2018.csv'  ### your data
+filename = paste(path,fn,sep = '\\')
+md = read.csv(filename)
+colnames(md)[1] = 'ID'
+colnames(md)[2:length(md)] = paste("md",colnames(md[,c(2:length(md))]))
+rownames(md) = md[,1]
+
+fn = 'FEP_fmri_Feb2018.csv'  ### your data
+filename = paste(path,fn,sep = '\\')
+fmri = read.csv(filename)
+colnames(fmri)[1] = 'ID'
+colnames(fmri)[2:length(fmri)] = paste("fmri",colnames(fmri[,c(2:length(fmri))]))
+rownames(fmri) = fmri[,1]
+
+fn = 'np.csv' 
+filename = paste(path,fn,sep = '\\')
+np = read.csv(filename)
+np = subset(np,np$visit == 'year-1')
+
+```
+
+```{r concatenate multi-modal data}
+mt = join_all(list(clin,fa,md,fmri), by = 'ID',type = 'inner')
+mt[mt == ""] = NA
+mt = mt[ , apply(mt, 2, function(x) !any(is.nan(x)))]
+mt = subset(mt,mt$visit == 'year-1')  
+
+mt = join_all(list(np,mt), by = 'study_ID',type = 'inner')
+mt=mt[!is.na(mt$gds),]
+#mt <- na.omit(mt)
+mt=mt[-dim(mt)[1],] # remove FEP2068, repetitive subject
+```
+
+```{r seperate NC and Patients}
+PAT = subset(mt,group == 1) #patients
+NC = subset(mt,group == 2) #controls
+```
+
+```{r select fmri dataset in PAT and NC group}
+
+fMRI_PAT=select(PAT,starts_with('fmri'))
+rownames(fMRI_PAT)=PAT$study_ID
+
+fMRI_NC=select(NC,starts_with('fmri'))
+rownames(fMRI_NC)=NC$study_ID
+```
+
+
+```{r Select FS (6 Factor scores) for NC and patients}
+FS_NC=select(NC,ends_with('_Std')) # 6 Factor Score
+rownames(FS_NC)=NC$study_ID
+FS_PAT=select(PAT,ends_with('_Std')) # 6 Factor Score
+rownames(FS_PAT)=PAT$study_ID
+```
+
+
+
+## Part 2: Do sCCA
+```{r creat sample }
+sampleid = 1:nrow(FS_PAT)
+
+brain_sample <- mclapply(sampleid, function(id) fMRI_PAT[id,])
+behavior_sample <- mclapply(sampleid, function(id) FS_PAT[id,])
+```
+
+### 2.1 select best parameters for regulariation
+```{r }
+#which(is.na(FS_PAT))#There were 2 NA in FS_PAT
+#replace the NA by mean value
+FS_PAT[,1] = impute(FS_PAT[,1],mean)
+FS_PAT[,5] = impute(FS_PAT[,5],mean)
+x_pen <- seq(0.1,1,length.out=10)
+y_pen <- seq(0.1,1,length.out=10)
+gs.mat <- matrix(0, nrow = 10, ncol = 10)
+
+for (pen_xseq in x_pen) {
+  pen_xseq_int = round(pen_xseq*10)
+  for (pen_yseq in y_pen) {
+    pen_yseq_int = round(pen_yseq*10)
+    gs=ccaDW(fMRI_PAT, FS_PAT,pen_xseq,pen_yseq,6)
+    gs.mat[pen_xseq_int,pen_yseq_int] = mean(abs(gs$cor))
+  }
+}
+```
+```{r find the best parameters }
+rownames(gs.mat) <- x_pen
+colnames(gs.mat) <- y_pen
+pheatmap(gs.mat,cluster_cols = FALSE,cluster_rows = FALSE,treeheight_col = FALSE,treeheight_row = FALSE)
+which.max.matrix(gs.mat)#select the best parameters of max coralations
+```
+
+
+### 2.2 select components based on covariance matrix
+```{r }
+modenum <- dim(FS_PAT)[2] #number of all possible canonical variates
+scca.org <- ccaDW(fMRI_PAT, FS_PAT,0.8,0.9,modenum) #0.8 and 0.9 here are the best parameteres selected above in the grid search
+brain_std = apply(fMRI_PAT, 2, scale)
+med_std <- apply(FS_PAT,2,scale)
+covmat <- t(scca.org$u) %*% t(brain_std) %*% med_std %*% scca.org$v #calculate covariance matrix
+varE <- diag(covmat)^2 / sum(diag(covmat)^2) #calcualte covariance explained by each component
+varE.df <- data.frame(modenum = as.factor(1:modenum), var = varE) #prepare dataframe for plotting
+candnum = 6 #number selected based on the scree plot
+
+p.var<-ggplot(varE.df,aes(modenum,var)) +
+  geom_point(stat = 'identity',aes(color = var>0.1, size = 10)) +
+  geom_hline(yintercept = 1/10,linetype="dashed") +
+  scale_x_discrete(name ="Canonical-Var", limits=c(1:modenum),breaks =  c(1,seq(1,modenum,1))) +
+  scale_y_continuous(expand = c(0, 0),limits=c(0,1),labels = scales::percent,name = "Variance Explained", breaks=seq(0,1,length=4)) +
+  theme_classic(base_size = 20) +
+  theme(legend.position = 'none') 
+
+p.var
+```
+
+
+```{r run sCCA on each sample to estimate average correlation}
+if(FALSE){
+scca.cand <- ccaDW(fMRI_PAT, FS_PAT,0.8,0.9,candnum)
+scca.cca<-mclapply(sampleid,function(i) ccaDW(brain_sample[[i]],behavior_sample[[i]],0.8,0.9,6)) #loop through split
+scca.cca.ro <- sapply(scca.cca,function(x) reorderCCA(x,scca.cand,6)) #reorder the component so they match across splits
+scca.cca.cor <- rowMeans(simplify2array(scca.cca.ro['cors',]),na.rm =T) #calculate average of cca correlations
+scca.cca.cor.se <- rowSds(simplify2array(scca.cca.ro['cors',]),na.rm =T)/sqrt(dim(scca.cca.ro)[2]) #calculate standard error of correlations  
+}
+```
+
+
+### 2.3 permutation test
+```{r permutation test}
+scca.cand <- ccaDW(fMRI_PAT, FS_PAT,0.8,0.9,candnum)
+num.perm <- 1000 #number of permutaitons to run
+behavior.perm <- rlply(num.perm,FS_PAT[sample(nrow(FS_PAT)),]) #permute the clinical matrix by row
+scca.perm.cca<-sapply(behavior.perm, function(y_perm){ out<-ccaDWpermorder(fMRI_PAT,y_perm,0.8,0.9,candnum,scca.cand)} ) #run scca again with permuted clinical but with original connectivity
+perm.cor <- simplify2array(scca.perm.cca['cors',]) #extrac the correlations
+perm.pval = array(0,dim = 6)
+```
+
+```{r calculate p-value}
+for (f in 1:6) {
+  perm.cor.cv =  perm.cor[f,]
+  perm.pval[f] = length(which(perm.cor.cv>=scca.cand$cors[f]))/length(which(is.na(perm.cor.cv) == FALSE))
+}
+perm.pval
+scca.org$cors
+```
+
+```{r calculate the scores}
+brain_scores = brain_std %*% scca.org$u
+behavior_scores = med_std %*% scca.org$v
+v = scca.org$v#cognitive factor loadings 
+rownames(v) = colnames(FS_PAT)
+kable(v)
+```
+  
+We can see that the first canonical variate is Memory-related  
+the second canonical variate is Ideational-related  
+the 6th canonical variate is IdeationalExecutive-related(which is significant through permutation test)
+
+
+### 2.4 scatter plot about correlation
+```{r }
+df1=cbind(as.data.frame(behavior_scores[,1]),as.data.frame(brain_scores[,1]))
+colnames(df1)=c('cognition','connectivity')
+ggplot(df1, aes(x=cognition, y=connectivity))+ 
+  geom_point( size = 2,alpha=0.7)+theme_bw(base_size=15)+geom_smooth(method = "lm",se = FALSE )+
+  labs(x='cognitive score',y='connectivity score',title="Correlation: Memory-related")
+```
+
+```{r }
+df1=cbind(as.data.frame(behavior_scores[,2]),as.data.frame(brain_scores[,2]))
+colnames(df1)=c('cognition','connectivity')
+ggplot(df1, aes(x=cognition, y=connectivity))+ 
+  geom_point( size = 2,alpha=0.7)+theme_bw(base_size=15)+geom_smooth(method = "lm",se = FALSE )+
+  labs(x='cognitive score',y='connectivity score',title="Correlation: Ideational-related")
+```
+```{r }
+df1=cbind(as.data.frame(behavior_scores[,6]),as.data.frame(brain_scores[,6]))
+colnames(df1)=c('cognition','connectivity')
+ggplot(df1, aes(x=cognition, y=connectivity))+ 
+  geom_point( size = 2,alpha=0.7)+theme_bw(base_size=15)+geom_smooth(method = "lm",se = FALSE )+
+  labs(x='cognitive score',y='connectivity score',title="Correlation: IdeationalExecutive-related")
+```
+  
+We can see that:
+the second canonical variate is not so much related between cognitive score and connectivity score  
+so,we keep the 1st(which has most Explained Variance) and 6th canonical variates(which is significant) to do clustering
+
+## Part 3: Clustering
+
+### 3.1 Hierachical clustering
+```{r}
+CV_cog = cbind(as.data.frame(behavior_scores[,1]),as.data.frame(behavior_scores[,6]))
+colnames(CV_cog) = c('Memory-related','IdeationalExecutive-related')
+
+d = dist(scale(CV_cog),method = 'euclidean')
+hc = hclust(d,method = 'ward.D')
+clust = cutree(hc,k = 4)
+table(clust)
+```
+
+### 3.2 Heat map
+```{r}
+clust=as.factor(clust)
+PAT_whole=cbind(clust,PAT)
+mat=t(as.matrix(CV_cog))
+cv=data.frame('Diag'=as.factor(PAT_whole$diag2),'Cluster'=as.factor(PAT_whole$clust))
+rownames(cv)=PAT_whole$study_ID
+colnames(cv)=c('Diag','Cluster')
+phem=pheatmap(mat,scale = 'row',annotation_col = t(cv), clustering_method="ward.D",cutree_cols=4,
+              clustering_distance_cols = "euclidean",show_colnames = TRUE)
+```
+
+#### 3.3 Scatter plot
+
+make a scatterplot for four clusters of subjects along IdeationalExecutive-related and Memory-related fmri scores 
+```{r}
+CV_cog2=cbind(CV_cog,clust)
+ggplot(CV_cog2, aes(x=`Memory-related`, y=`IdeationalExecutive-related`, col=clust)) +
+  geom_point(aes(shape=clust), size=2)+
+  coord_cartesian(xlim = c(-3,3), ylim = c(-3,3))  + 
+  geom_segment(x = 0,xend=0, y = -3,yend=3,size=1,col='black')+
+  geom_segment(x = -3,xend=3, y = 0,yend=0,size=1,col='black')+theme_minimal()+
+  labs(title='Memory- and IdeationalExecutive-related connectivity for 4 clusters')
+```
+
+#### 2.2.4 Pattern of abnormal connectivity 
+Calulate fisher Z-score of fmri connectivity for  NC group
+```{r}
+n=nrow(fMRI_NC) #number of subjects
+fMRI_labels=read.table(str_c(path,'\\fMRI_label.txt'))
+q=ncol(fMRI_labels) # number of parcels for fMRI
+fMRI_matrix=matrix(seq(1,q^2),ncol = q,nrow=q) # initialize 2D distance matrix for each subject
+idx_lower=fMRI_matrix[lower.tri(fMRI_matrix)]
+rownames(fMRI_matrix)=as.matrix(fMRI_labels)
+colnames(fMRI_matrix)=as.matrix(fMRI_labels)
+fMRI_array=array(0,dim=c(q,q,n)) # initialize 3D distance matrix for all subjects, the 3rd dimension corresponds to subject index
+for (j in 1:n){
+count=1
+fMRI_matrix=matrix(0,ncol = q,nrow=q)
+for (i in idx_lower) {
+  fMRI_matrix[i]=fMRI_NC[j,count]
+  count=count+1
+}
+fMRI_matrix=t(fMRI_matrix)+fMRI_matrix
+fMRI_array[,,j]=fMRI_matrix
+}
+```
+
+calculate the mean value of fMRI matrix in NC group(95 subjects)
+```{r}
+fMRI_matrix_mean = matrix(seq(1,q^2),ncol = q,nrow=q) # initialize 2D distance matrix 
+  for (j in 1:78){
+    for (k in 1:78){
+      fMRI_matrix_mean[j,k] = mean(fMRI_array[j,k,])
+    }
+  }
+```
+
+
+Here We generate average matrix showing normal connecivtity. Each element is Z score of U statistic of U-test.
+
+```{r}
+fMRI_Utest_vec=vector(length = ncol(fMRI_NC)) # initialize 1D vector
+for (i in 1:ncol(fMRI_NC))
+{
+  Utest=wilcox.test(fMRI_PAT[,i], fMRI_NC[,i])
+  Umean=nrow(fMRI_NC)*nrow(fMRI_PAT)/2
+  Usd=sqrt(nrow(fMRI_NC)*nrow(fMRI_PAT)*(nrow(fMRI_NC)+nrow(fMRI_PAT)+1)/12)
+  Z=(Utest$statistic-Umean)/Usd
+  fMRI_Utest_vec[i]=Z
+}
+fMRI_Utest_mat=matrix(seq(1,q^2),ncol = q,nrow=q) # initialize 2D distance matrix
+idx_lower=fMRI_Utest_mat[lower.tri(fMRI_Utest_mat)]
+count=1
+fMRI_Utest_mat=matrix(0,ncol = q,nrow=q)
+for (i in idx_lower) {
+  fMRI_Utest_mat[i]=fMRI_Utest_vec[count]
+  count=count+1
+}
+fMRI_Utest_mat=t(fMRI_Utest_mat)+fMRI_Utest_mat
+```
+
+Plot the matrix above
+```{r}
+fMRI_labels2=read.table(str_c(path,'\\fMRI_label2_2.txt'),stringsAsFactors=FALSE)#this file is the result of clustering percels
+rownames(fMRI_Utest_mat)=as.matrix(fMRI_labels)   
+colnames(fMRI_Utest_mat)=as.matrix(fMRI_labels)  
+cv_fmri=data.frame('group'=fMRI_labels2$V1)
+rownames(cv_fmri)=as.matrix(fMRI_labels) 
+### order the fMRI_Utest_mat by groups(BrainNet)
+index <- order(cv_fmri[,1])
+fMRI_Utest_mat_reorder = fMRI_Utest_mat[index,index]
+fMRI_labels2_reorder = cv_fmri[index,]
+
+col4 <- colorRampPalette(c("#00ffff","#0066ff","black","black","black","black","black","orange","red","yellow"))
+#fMRI_labels2$V1=as.factor(fMRI_labels2$V1)
+library(RColorBrewer)
+mat_colors_fmri <- list(group = brewer.pal(length(levels(fMRI_labels2_reorder)), "Paired"))
+# color palettes: http://www.datavis.ca/sasmac/brewerpal.html
+# display.brewer.all() # show all color palettes
+names(mat_colors_fmri$group) <- unique(fMRI_labels2_reorder) 
+gaps_vec=vector(length =length(unique(fMRI_labels2_reorder) )-1 )
+for (i in 1:(length(unique(fMRI_labels2_reorder) )-1))
+{
+  gaps_vec[i]=which(fMRI_labels2_reorder==as.character(unique(fMRI_labels2_reorder)[i+1]))[1]
+}
+
+
+breaksList =seq(-4, 6, by = 1)
+
+
+pheatmap(
+  mat               = fMRI_Utest_mat_reorder,cluster_row = F, cluster_col = F,
+  color             = col4(10),
+  breaks=breaksList,
+  border_color      = NA,
+  show_colnames     = FALSE,
+  show_rownames     = FALSE,
+  annotation_col    = cv_fmri,
+  annotation_colors = mat_colors_fmri,
+  drop_levels       = TRUE,
+  fontsize          = 14,
+  gaps_col          = gaps_vec-1,
+  gaps_row          = gaps_vec-1,
+  main              = 'Pattern of abnormal connectivity shared by BrainNet'
+)
+```
+
+### 3.5 Pattern of abnormal connectivity in 4 clusters(PAT group)
+Here We generate a matrix showing abnormal connecivtity for each biotype. Each element is Z score of U statistic of U-test.
+plot Biotype 1
+```{r}
+PAT1=filter(PAT_whole,clust==1)
+fMRI_PAT1=select(PAT1,starts_with('fmri'))
+rownames(fMRI_PAT1)=PAT1$study_ID
+
+col4 <- colorRampPalette(c("#00ffff","#0066ff","black","black","black","black","black","orange","red","yellow"))
+
+fMRI_Utest_vec1=vector(length = ncol(fMRI_NC)) # initialize 1D vector
+for (i in 1:ncol(fMRI_NC))
+{
+  Utest=wilcox.test(fMRI_PAT1[,i], fMRI_NC[,i])
+  Umean=nrow(fMRI_NC)*nrow(fMRI_PAT1)/2
+  Usd=sqrt(nrow(fMRI_NC)*nrow(fMRI_PAT1)*(nrow(fMRI_NC)+nrow(fMRI_PAT1)+1)/12)
+  Z=(Utest$statistic-Umean)/Usd
+  fMRI_Utest_vec1[i]=Z
+}
+
+count=1
+fMRI_Utest_mat1=matrix(0,ncol = q,nrow = q)
+for (i in idx_lower) {
+  fMRI_Utest_mat1[i]=fMRI_Utest_vec1[count]
+  count=count+1
+}
+fMRI_Utest_mat1=t(fMRI_Utest_mat1)+fMRI_Utest_mat1
+breaksList =seq(-4, 6, by = 1)
+rownames(fMRI_Utest_mat1)=as.matrix(fMRI_labels)
+colnames(fMRI_Utest_mat1)=as.matrix(fMRI_labels)
+fMRI_Utest_mat1_reorder = fMRI_Utest_mat1[index,index]
+pheatmap(
+  mat               = fMRI_Utest_mat1_reorder,cluster_row = F, cluster_col = F,
+  color             = col4(10),
+  breaks=breaksList,
+  border_color      = NA,
+  show_colnames     = FALSE,
+  show_rownames     = FALSE,
+  annotation_col    = cv_fmri,
+  annotation_colors = mat_colors_fmri,
+  drop_levels       = TRUE,
+  fontsize          = 14,
+  gaps_col          = gaps_vec-1,
+  gaps_row          = gaps_vec-1,
+  main              = 'Pattern of abnormal connectivity for biotype 1'
+)
+```
+
+
+plot Biotype 2
+```{r}
+PAT2=filter(PAT_whole,clust==2)
+fMRI_PAT2=select(PAT2,starts_with('fmri'))
+rownames(fMRI_PAT2)=PAT2$study_ID
+
+fMRI_Utest_vec2=vector(length = ncol(fMRI_NC)) # initialize 1D vector
+for (i in 1:ncol(fMRI_NC))
+{
+  Utest=wilcox.test(fMRI_PAT2[,i], fMRI_NC[,i])
+  Umean=nrow(fMRI_NC)*nrow(fMRI_PAT2)/2
+  Usd=sqrt(nrow(fMRI_NC)*nrow(fMRI_PAT2)*(nrow(fMRI_NC)+nrow(fMRI_PAT2)+1)/12)
+  Z=(Utest$statistic-Umean)/Usd
+  fMRI_Utest_vec2[i]=Z
+}
+
+count=1
+fMRI_Utest_mat2=matrix(0,ncol = q,nrow=q)
+for (i in idx_lower) {
+  fMRI_Utest_mat2[i]=fMRI_Utest_vec2[count]
+  count=count+1
+}
+fMRI_Utest_mat2=t(fMRI_Utest_mat2)+fMRI_Utest_mat2
+
+rownames(fMRI_Utest_mat2)=as.matrix(fMRI_labels)
+colnames(fMRI_Utest_mat2)=as.matrix(fMRI_labels)
+fMRI_Utest_mat2_reorder = fMRI_Utest_mat2[index,index]
+pheatmap(
+  mat               = fMRI_Utest_mat2_reorder,cluster_row = F, cluster_col = F,
+  color             = col4(10),
+  breaks=breaksList,
+  border_color      = NA,
+  show_colnames     = FALSE,
+  show_rownames     = FALSE,
+  annotation_col    = cv_fmri,
+  annotation_colors = mat_colors_fmri,
+  drop_levels       = TRUE,
+  fontsize          = 14,
+  gaps_col          = gaps_vec-1,
+  gaps_row          = gaps_vec-1,
+  main              = 'Pattern of abnormal connectivity for biotype 2'
+)
+```
+
+
+
+plot Biotype 3
+```{r}
+PAT3=filter(PAT_whole,clust==3)
+fMRI_PAT3=select(PAT3,starts_with('fmri'))
+rownames(fMRI_PAT3)=PAT3$study_ID
+
+fMRI_Utest_vec3=vector(length = ncol(fMRI_NC)) # initialize 1D vector
+for (i in 1:ncol(fMRI_NC))
+{
+  Utest=wilcox.test(fMRI_PAT3[,i], fMRI_NC[,i])
+  Umean=nrow(fMRI_NC)*nrow(fMRI_PAT3)/2
+  Usd=sqrt(nrow(fMRI_NC)*nrow(fMRI_PAT3)*(nrow(fMRI_NC)+nrow(fMRI_PAT3)+1)/12)
+  Z=(Utest$statistic-Umean)/Usd
+  fMRI_Utest_vec3[i]=Z
+}
+
+count=1
+fMRI_Utest_mat3=matrix(0,ncol = q,nrow=q)
+for (i in idx_lower) {
+  fMRI_Utest_mat3[i]=fMRI_Utest_vec3[count]
+  count=count+1
+}
+fMRI_Utest_mat3=t(fMRI_Utest_mat3)+fMRI_Utest_mat3
+
+rownames(fMRI_Utest_mat3)=as.matrix(fMRI_labels)
+colnames(fMRI_Utest_mat3)=as.matrix(fMRI_labels)
+fMRI_Utest_mat3_reorder = fMRI_Utest_mat3[index,index]
+pheatmap(
+  mat               = fMRI_Utest_mat3_reorder,cluster_row = F, cluster_col = F,
+  color             = col4(10),
+  breaks=breaksList,
+  border_color      = NA,
+  show_colnames     = FALSE,
+  show_rownames     = FALSE,
+  annotation_col    = cv_fmri,
+  annotation_colors = mat_colors_fmri,
+  drop_levels       = TRUE,
+  fontsize          = 14,
+  gaps_col          = gaps_vec-1,
+  gaps_row          = gaps_vec-1,
+  main              = 'Pattern of abnormal connectivity for biotype 3'
+)
+```
+
+
+plot Biotype 4
+```{r}
+PAT4=filter(PAT_whole,clust==4)
+fMRI_PAT4=select(PAT4,starts_with('fmri'))
+rownames(fMRI_PAT4)=PAT4$study_ID
+
+fMRI_Utest_vec4=vector(length = ncol(fMRI_NC)) # initialize 1D vector
+for (i in 1:ncol(fMRI_NC))
+{
+  Utest=wilcox.test(fMRI_PAT4[,i], fMRI_NC[,i])
+  Umean=nrow(fMRI_NC)*nrow(fMRI_PAT4)/2
+  Usd=sqrt(nrow(fMRI_NC)*nrow(fMRI_PAT4)*(nrow(fMRI_NC)+nrow(fMRI_PAT4)+1)/12)
+  Z=(Utest$statistic-Umean)/Usd
+  fMRI_Utest_vec4[i]=Z
+}
+
+count=1
+fMRI_Utest_mat4=matrix(0,ncol = q,nrow=q)
+for (i in idx_lower) {
+  fMRI_Utest_mat4[i]=fMRI_Utest_vec4[count]
+  count=count+1
+}
+fMRI_Utest_mat4=t(fMRI_Utest_mat4)+fMRI_Utest_mat4
+
+rownames(fMRI_Utest_mat4)=as.matrix(fMRI_labels)
+colnames(fMRI_Utest_mat4)=as.matrix(fMRI_labels)
+fMRI_Utest_mat4_reorder = fMRI_Utest_mat4[index,index]
+
+pheatmap(
+  mat               = fMRI_Utest_mat4_reorder,cluster_row = F, cluster_col = F,
+  color             = col4(10),
+  breaks=breaksList,
+  border_color      = NA,
+  show_colnames     = FALSE,
+  show_rownames     = FALSE,
+  annotation_col    = cv_fmri,
+  annotation_colors = mat_colors_fmri,
+  drop_levels       = TRUE,
+  fontsize          = 14,
+  gaps_col          = gaps_vec-1,
+  gaps_row          = gaps_vec-1,
+  main              = 'Pattern of abnormal connectivity for biotype 4'
+)
+```
