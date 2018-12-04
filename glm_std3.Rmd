@@ -1,0 +1,102 @@
+---
+title: "glm_std2"
+author: "Yuan"
+date: "2018/11/28"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE, message=FALSE, warning=FALSE, paged.print=FALSE)
+```
+
+### GLM example
+
+```{r input data}
+library(nnet)
+library(Hmisc)
+WholeSamples = read.csv('E://lab//FEP//1121GLM//FEP_All_Nov2018.csv')
+```
+
+```{r split to NC and PAT}
+PAT = subset(WholeSamples,group == 1)
+regressData_PAT = PAT#make a copy
+NC = subset(WholeSamples,group == 2)
+regressData_NC = NC
+```
+
+```{r example}
+which(colnames(NC)=="fa.SUPERIOR.PARIETAL.left")#37 the first brain feature 
+which(colnames(NC)=="fmri.Thalamus_L_Thalamus_R")#3232 the last brain feature
+NC.glm1 = lm(fmri.SFG_R_CerebellumGM_L ~ age + gender + race,data = NC)
+summary(NC.glm1)
+```
+We can see from the example that there are not significant results in race, gender and age  
+
+### Age gender and race correction in NC
+
+As for gender and race are factor variates,they changed to dummy variate through linear mode, we should build 0/1 mats to do correction  
+
+```{r NC}
+time = proc.time()
+
+NCgenderD = nnet::class.ind(NC$gender)
+NCgenderD = NCgenderD[,-1]#to avoid collinear,we drop the fisrt variate
+NCraceD = nnet::class.ind(NC$race)
+NCraceD = NCraceD[,-1]#to avoid collinear,we drop the fisrt variate
+NC_D = cbind(NC$age,NCgenderD,NCraceD)
+
+coef_lm = sapply(37:3232,function(i){
+  NC.glm = lm(NC[,i] ~ age + gender + race, data = NC)
+  return(NC.glm$coefficients)
+})
+coef_lm1 = coef_lm[-1,]#drop the intercept to do age,gender,race correction
+RegressNC = sapply(37:3232,function(i){
+  return(NC[,i]-(NC_D %*% coef_lm1[,i-36]))
+})
+proc.time()-time
+```
+
+```{r PAT}
+time = proc.time()
+PATgenderD = nnet::class.ind(PAT$gender)
+PATgenderD = PATgenderD[,-1]
+PATraceD = nnet::class.ind(PAT$race)
+PATraceD = PATraceD[,-1]
+PAT_D = cbind(PAT$age,PATgenderD,PATraceD)
+RegressPAT = sapply(37:3232, function(i){
+  return(PAT[,i]-PAT_D * coef_lm1[i-36])
+})
+proc.time()-time
+```
+```{r store the correction results}
+regressData_NC[,37:3232] = RegressNC
+regressData_PAT[,37:3232] = RegressPAT
+WholeSamples_std = rbind(regressData_PAT,regressData_NC)
+write.csv(WholeSamples_std,file = "E://lab//FEP//1121GLM//FEP_All_Nov2018_MRIstd12.csv",row.names = F)
+```
+### med_dose correction in PAT
+```{r}
+regressData_PAT$med_dose = Hmisc::impute(regressData_PAT$med_dose,0) # set NA to 0
+which(is.na(regressData_PAT$med_dose),arr.ind = TRUE)
+```
+```{r}
+regressData_PAT2 = regressData_PAT #to store correction results 
+time = proc.time()
+coef_lm3 = sapply(37:3232,function(i){
+  PAT.glm = lm(PAT[,i] ~ med_dose, data = PAT)
+  return(PAT.glm$coefficients)
+})
+coef_lm4 = coef_lm3[-1,]#drop the intercept to do age,gender,race correction
+RegressPAT2 = sapply(37:3232,function(i){
+  return(PAT[,i]-(regressData_PAT$med_dose * coef_lm4[i-36]))
+})
+proc.time()-time
+```
+
+
+
+```{r store the final correction results}
+regressData_PAT2[,37:3232] = RegressPAT2
+WholeSamples_std2 = rbind(regressData_PAT2,regressData_NC)
+write.csv(WholeSamples_std2,file = "E://lab//FEP//1121GLM//FEP_All_Nov2018_MRI_med_dose_std9_.csv",row.names = F)
+```
